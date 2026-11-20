@@ -439,7 +439,9 @@ And two probes against the check of the signed transaction
 ## Agent
 
 A small payment agent on **NEAR AI Cloud** (`agent/`, Node 24, plain `fetch`
-through NEAR's own client). It holds no key. It has two tools:
+through NEAR's own client). It holds no NEAR key: its only key is its ICP
+identity, which lets it ask the guard for a signature but never sign on its
+own. It has two tools:
 
 - `get_balance` — the canister's NEAR account and its testnet balance (RPC).
 - `request_payment(receiver, amount_near)` — asks the guard, as the agent's
