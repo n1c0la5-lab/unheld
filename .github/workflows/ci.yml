@@ -77,6 +77,10 @@ jobs:
         run: ./setup.sh
       - name: ./setup.sh again (second run reuses the network)
         run: ./setup.sh
+      - name: A canister as the guard's owner (two-step handover, then set_policy, by inter-canister calls)
+        env:
+          OWNER_IDENTITY: guard-quickstart-owner
+        run: scripts/e2e-owner-canister.sh
       - name: The lock refuses a non-local environment (exit code 2, before anything runs)
         run: |
           for v in ICP_ENVIRONMENT ICP_ENV ICP_NETWORK; do

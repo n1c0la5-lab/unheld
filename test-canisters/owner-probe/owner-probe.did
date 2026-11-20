@@ -1,0 +1,10 @@
+type Policy = record {
+  per_tx_limit_yocto : text;
+  daily_limit_yocto : text;
+  allowlist : vec text;
+  nep413_recipients : opt vec text;
+};
+service : {
+  accept_owner : (principal) -> (variant { Ok; Err : text });
+  set_policy : (principal, Policy) -> (variant { Ok; Err : text });
+}

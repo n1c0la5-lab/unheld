@@ -1,0 +1,18 @@
+[package]
+name = "owner-probe"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Test only: a canister that owns the guard, for scripts/e2e-owner-canister.sh. Not part of Unheld."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+candid = "0.10"
+ic-cdk = "0.20"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+candid_parser = "0.2"
