@@ -141,7 +141,8 @@ fn init(args: Option<InitArgs>) {
     });
 }
 
-// Owner, agent, policy, today's spent total and the audit log survive upgrades.
+// Owner, pending owner, agent, policy, today's spent total and the audit log
+// survive upgrades.
 #[ic_cdk::pre_upgrade]
 fn pre_upgrade() {
     let stable = with_state(|s| StableState {
@@ -327,6 +328,20 @@ fn set_policy(policy: Policy) -> Result<(), String> {
     with_state(|s| s.guard.set_policy(msg_caller(), &policy)).map_err(|e| e.to_string())
 }
 
+/// Owner only. Step 1 of an owner handover: `opt p` proposes `p` (replacing an
+/// earlier proposal), `null` withdraws it. Changes nothing else.
+#[ic_cdk::update]
+fn propose_owner(candidate: Option<Principal>) -> Result<(), String> {
+    with_state(|s| s.guard.propose_owner(msg_caller(), candidate, time())).map_err(|e| e.to_string())
+}
+
+/// Only the proposed owner. Step 2: the caller becomes the owner, the previous
+/// owner loses every right. Agent, policy and spent total stay.
+#[ic_cdk::update]
+fn accept_owner() -> Result<(), String> {
+    with_state(|s| s.guard.accept_owner(msg_caller(), time())).map_err(|e| e.to_string())
+}
+
 /// Owner or agent.
 #[ic_cdk::query]
 fn get_config() -> Result<Config, String> {
@@ -353,5 +368,140 @@ mod candid_tests {
             CandidSource::Text(include_str!("../guard.did")),
         )
         .unwrap_or_else(|e| panic!("guard.did is out of date:\n{e}\n\ngenerated:\n{code}"));
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::StableState;
+    use crate::policy::{DailySpend, Outcome, Refusal};
+    use candid::{CandidType, Principal};
+
+    // The stable layout exactly as the version before owner handover writes
+    // it (main at 39f12b6; the canister code of the deployed 1f2ccd2 differs
+    // from it in one comment only): `Guard` without `pending_owner`,
+    // `Outcome` without the handover variants.
+    #[derive(CandidType)]
+    struct OldRules {
+        per_tx_limit: u128,
+        daily_limit: u128,
+        allowlist: Vec<String>,
+        nep413_recipients: Option<Vec<String>>,
+    }
+    #[derive(CandidType)]
+    enum OldOutcome {
+        Pending,
+        Signed { tx_hash: String },
+        MessageSigned { payload_hash: String },
+        Rejected { reason: String },
+    }
+    #[derive(CandidType)]
+    struct OldMessageInfo {
+        message_bytes: u64,
+        message_sha256: String,
+        nonce_hex: String,
+        callback_url: Option<String>,
+    }
+    #[derive(CandidType)]
+    struct OldEntry {
+        seq: u64,
+        time_ns: u64,
+        caller: Principal,
+        receiver_id: String,
+        yocto: String,
+        outcome: OldOutcome,
+        message: Option<OldMessageInfo>,
+    }
+    #[derive(CandidType)]
+    struct OldGuard {
+        owner: Principal,
+        agent: Option<Principal>,
+        rules: OldRules,
+        spend: DailySpend,
+        log: Vec<OldEntry>,
+        next_seq: u64,
+        rejected_unauthorized: u64,
+    }
+    #[derive(CandidType)]
+    struct OldStableState {
+        guard: OldGuard,
+        key_name: String,
+    }
+
+    fn p(n: u8) -> Principal {
+        Principal::from_slice(&[n; 29])
+    }
+
+    /// What the deployed version's `pre_upgrade` writes must restore in this
+    /// version's `post_upgrade` (same call: a one-element argument tuple),
+    /// with no owner proposal and every old entry intact.
+    #[test]
+    fn state_from_before_owner_handover_restores() {
+        let entry = |seq, outcome, message| OldEntry {
+            seq,
+            time_ns: 100 + seq,
+            caller: p(2),
+            receiver_id: "alice.testnet".into(),
+            yocto: "3".into(),
+            outcome,
+            message,
+        };
+        let old = OldStableState {
+            guard: OldGuard {
+                owner: p(1),
+                agent: Some(p(2)),
+                rules: OldRules {
+                    per_tx_limit: 5,
+                    daily_limit: 8,
+                    allowlist: vec!["alice.testnet".into()],
+                    nep413_recipients: Some(vec!["login.example".into()]),
+                },
+                spend: DailySpend { day: 20_759, spent: 3 },
+                log: vec![
+                    entry(0, OldOutcome::Signed { tx_hash: "T".into() }, None),
+                    entry(1, OldOutcome::Rejected { reason: "r".into() }, None),
+                    entry(2, OldOutcome::Pending, None),
+                    entry(
+                        3,
+                        OldOutcome::MessageSigned { payload_hash: "H".into() },
+                        Some(OldMessageInfo {
+                            message_bytes: 5,
+                            message_sha256: "ab".into(),
+                            nonce_hex: "09".into(),
+                            callback_url: None,
+                        }),
+                    ),
+                ],
+                next_seq: 4,
+                rejected_unauthorized: 7,
+            },
+            key_name: "key_1".into(),
+        };
+        // Exactly what `stable_save((stable,))` / `stable_restore()` do.
+        let bytes = candid::encode_args((old,)).unwrap();
+        let (mut new,): (StableState,) = candid::decode_args(&bytes).unwrap();
+
+        assert_eq!(new.key_name, "key_1");
+        let g = &mut new.guard;
+        let c = g.config(p(1), 20_759 * crate::policy::NANOS_PER_DAY).unwrap();
+        assert_eq!((c.owner, c.pending_owner, c.agent), (p(1), None, Some(p(2))));
+        assert_eq!((c.policy.per_tx_limit_yocto.as_str(), c.policy.daily_limit_yocto.as_str()), ("5", "8"));
+        assert_eq!(c.policy.allowlist, ["alice.testnet"]);
+        assert_eq!(c.policy.nep413_recipients, Some(vec!["login.example".to_string()]));
+        assert_eq!((c.spent_today_yocto.as_str(), c.rejected_unauthorized), ("3", 7));
+        let log = g.audit_log(p(1)).unwrap();
+        assert_eq!(log.iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(log[0].outcome, Outcome::Signed { tx_hash: "T".into() });
+        assert_eq!(log[1].outcome, Outcome::Rejected { reason: "r".into() });
+        assert_eq!(log[2].outcome, Outcome::Pending);
+        assert_eq!(log[3].outcome, Outcome::MessageSigned { payload_hash: "H".into() });
+        assert_eq!(log[3].message.as_ref().unwrap().message_sha256, "ab");
+
+        // The restored guard takes a handover; the log continues at seq 4.
+        assert_eq!(g.accept_owner(p(5), 1), Err(Refusal::NotPendingOwner));
+        g.propose_owner(p(1), Some(p(5)), 1).unwrap();
+        g.accept_owner(p(5), 2).unwrap();
+        let log = g.audit_log(p(5)).unwrap();
+        assert_eq!(log.last().map(|e| (e.seq, e.outcome.clone())), Some((5, Outcome::OwnerAccepted { previous_owner: p(1) })));
     }
 }
