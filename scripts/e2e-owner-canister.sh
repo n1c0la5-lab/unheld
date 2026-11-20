@@ -46,6 +46,12 @@ AGENT_P=$(principal "$AGENT")
 STRANGER_P=$(principal "$STRANGER")
 [[ "$OWNER_P" != "2vxsx-fae" ]] || { echo "refusing: the owner identity is anonymous" >&2; exit 2; }
 
+# The owner pays for the guard's install in `local` and for the probe (about 2T
+# each). A fresh identity has no cycles (as in CI), so it gets them from the
+# anonymous identity, which a local managed network funds; the demo refills
+# its canister the same way. Only `-e local` is ever named above.
+icp cycles transfer 10t "$OWNER_P" "${E[@]}" --identity anonymous -q >/dev/null
+
 # yoctoNEAR as decimal strings (u128 does not fit the shell's integers).
 Y_0_1=100000000000000000000000
 Y_0_2=200000000000000000000000
