@@ -12,6 +12,7 @@ type Policy = record {
 };
 type Config = record {
   owner : principal;
+  pending_owner : opt principal;
   agent : opt principal;
   policy : Policy;
   utc_day : nat64;
@@ -23,6 +24,9 @@ type Outcome = variant {
   Signed : record { tx_hash : text };
   MessageSigned : record { payload_hash : text };
   Rejected : record { reason : text };
+  OwnerProposed : record { candidate : principal };
+  OwnerProposalWithdrawn : record { candidate : principal };
+  OwnerAccepted : record { previous_owner : principal };
 };
 type MessageInfo = record {
   message_bytes : nat64;
@@ -46,6 +50,8 @@ service : (opt InitArgs) -> {
   sign_message : (Nep413Request) -> (variant { Ok : SignedMessage; Err : text });
   set_agent : (opt principal) -> (variant { Ok; Err : text });
   set_policy : (Policy) -> (variant { Ok; Err : text });
+  propose_owner : (opt principal) -> (variant { Ok; Err : text });
+  accept_owner : () -> (variant { Ok; Err : text });
   get_config : () -> (variant { Ok : Config; Err : text }) query;
   audit_log : () -> (variant { Ok : vec AuditEntry; Err : text }) query;
 }

@@ -139,11 +139,11 @@ grep -q "spent_today_yocto = \"$(yocto 0.5)\"" <<<"$CONFIG_BEFORE" && ok "spent 
 grep -q 'rejected_unauthorized = 3' <<<"$CONFIG_BEFORE" && ok "3 requests from non-owner/non-agent counted, not logged" || bad "rejected_unauthorized" "$CONFIG_BEFORE"
 
 echo "== upgrade"
-upgrades() { icp canister logs guard 2>/dev/null | grep -c 'post_upgrade: state restored' || true; }
+upgrades() { icp canister logs guard --identity "$OWNER" 2>/dev/null | grep -c 'post_upgrade: state restored' || true; }
 UPGRADES_BEFORE=$(upgrades)
 icp deploy guard --mode upgrade -y --identity "$OWNER" >/dev/null 2>&1 || { echo "upgrade failed"; icp deploy guard --mode upgrade -y --identity "$OWNER"; exit 1; }
 UPGRADES_AFTER=$(upgrades)
-[[ "$UPGRADES_AFTER" -gt "$UPGRADES_BEFORE" ]] && ok "post_upgrade ran (canister log: $UPGRADES_BEFORE -> $UPGRADES_AFTER)" || bad "no post_upgrade in the canister log" "$(icp canister logs guard 2>&1 | tail -5)"
+[[ "$UPGRADES_AFTER" -gt "$UPGRADES_BEFORE" ]] && ok "post_upgrade ran (canister log: $UPGRADES_BEFORE -> $UPGRADES_AFTER)" || bad "no post_upgrade in the canister log" "$(icp canister logs guard --identity "$OWNER" 2>&1 | tail -5)"
 CONFIG_AFTER=$(call "$OWNER" get_config '()' | grep -v 'utc_day')
 LOG_AFTER=$(call "$OWNER" audit_log '()')
 ACCOUNT_AFTER=$(call "$OWNER" account '()' | grep -o 'account_id = "[0-9a-f]*"')

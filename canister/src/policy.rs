@@ -12,11 +12,20 @@
 //! reservation if a signature came back and releases it if signing failed.
 //!
 //! Roles:
-//! - `owner`: the identity that installed the canister; never anonymous. Sets
-//!   the agent and the policy. Cannot request signatures.
+//! - `owner`: the identity that installed the canister, until it hands over;
+//!   never anonymous. Sets the agent and the policy. Cannot request
+//!   signatures. May be a person or another canister.
 //! - `agent`: exactly one principal, set by the owner; never the owner, never
 //!   anonymous. The only caller that may request signatures. Cannot change
 //!   the agent or the policy.
+//!
+//! Owner handover takes two steps, so a mistyped principal cannot take over:
+//! the owner proposes a successor ([`Guard::propose_owner`]), and only that
+//! successor can accept ([`Guard::accept_owner`]). Until then nothing changes;
+//! the owner can withdraw or replace the proposal. On acceptance the old owner
+//! loses every right at once; agent, policy and today's spent total stay.
+//! A pending successor is never the agent, in either order: `propose_owner`
+//! refuses the agent, and `set_agent` refuses the pending successor.
 //!
 //! Rules, checked before every signature (safe default: everything denied):
 //! 1. per-transaction limit, 2. daily limit per UTC day, 3. receiver allowlist.
@@ -34,7 +43,10 @@
 //! Audit log: sign requests from the owner and the agent are logged with their
 //! outcome. Requests from anyone else are only counted
 //! (`rejected_unauthorized`): if they were logged, any stranger could push the
-//! real entries out of the bounded log.
+//! real entries out of the bounded log. Owner handover steps (proposed,
+//! withdrawn, accepted) are logged too, as their own outcomes; refused
+//! handover calls are not (they change nothing, and logging them would let
+//! strangers flood the log).
 
 use crate::near_tx::validate_account_id;
 use candid::{CandidType, Deserialize, Principal};
@@ -100,6 +112,12 @@ pub enum Refusal {
     InvalidCallbackUrl,
     RecipientForbidden(String),
     RecipientNotAllowed(String),
+    CandidateIsAnonymous,
+    CandidateIsOwner,
+    CandidateIsAgent,
+    NoPendingOwner,
+    NotPendingOwner,
+    AgentIsPendingOwner,
 }
 
 impl fmt::Display for Refusal {
@@ -144,6 +162,18 @@ impl fmt::Display for Refusal {
                 "rejected: NEP-413 messages for {r} are never signed (there a signature authorizes moving funds, outside this policy)"
             ),
             RecipientNotAllowed(r) => write!(f, "rejected: recipient {r} is not on the NEP-413 allowlist"),
+            CandidateIsAnonymous => write!(f, "the anonymous principal cannot be the owner"),
+            CandidateIsOwner => write!(f, "this principal is already the owner"),
+            CandidateIsAgent => write!(
+                f,
+                "the agent cannot become the owner; set another agent first, or propose a different principal"
+            ),
+            NoPendingOwner => write!(f, "there is no owner proposal to withdraw"),
+            NotPendingOwner => write!(f, "only the proposed owner may accept ownership"),
+            AgentIsPendingOwner => write!(
+                f,
+                "this principal is the proposed owner and cannot be the agent; withdraw the proposal first"
+            ),
         }
     }
 }
@@ -305,6 +335,13 @@ pub enum Outcome {
     /// A NEP-413 message was signed; base58 of the signed SHA-256 hash.
     MessageSigned { payload_hash: String },
     Rejected { reason: String },
+    /// Owner handover, step 1: `caller` (the owner) proposed `candidate`.
+    OwnerProposed { candidate: Principal },
+    /// `caller` (the owner) withdrew the proposal for `candidate`.
+    OwnerProposalWithdrawn { candidate: Principal },
+    /// Step 2: `caller` accepted and is the owner now; `previous_owner` has
+    /// no rights any more.
+    OwnerAccepted { previous_owner: Principal },
 }
 
 /// What the log keeps of a NEP-413 request. The message itself is not stored,
@@ -322,14 +359,15 @@ pub struct MessageInfo {
 
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AuditEntry {
-    /// Counts every request ever logged; gaps at the start show eviction.
+    /// Counts every entry ever logged; gaps at the start show eviction.
     pub seq: u64,
     pub time_ns: u64,
     pub caller: Principal,
     /// Transfer receiver or NEP-413 recipient, as requested (clipped), even
-    /// when invalid.
+    /// when invalid. Empty for owner handover entries.
     pub receiver_id: String,
-    /// As requested (clipped), even when invalid. Empty for NEP-413 requests.
+    /// As requested (clipped), even when invalid. Empty for NEP-413 requests
+    /// and owner handover entries.
     pub yocto: String,
     pub outcome: Outcome,
     /// Set for NEP-413 requests, `null` for transfers.
@@ -339,6 +377,8 @@ pub struct AuditEntry {
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub owner: Principal,
+    /// Proposed by the owner, not accepted yet. Has no rights until it accepts.
+    pub pending_owner: Option<Principal>,
     pub agent: Option<Principal>,
     pub policy: Policy,
     pub utc_day: u64,
@@ -397,6 +437,9 @@ fn clip(s: &str, max: usize) -> String {
 pub struct Guard {
     owner: Principal,
     agent: Option<Principal>,
+    /// Owner handover in progress. `Option` also so that state saved before
+    /// this field existed still decodes (as no proposal).
+    pending_owner: Option<Principal>,
     rules: Rules,
     spend: DailySpend,
     log: Vec<AuditEntry>,
@@ -413,6 +456,7 @@ impl Guard {
         Ok(Guard {
             owner,
             agent: None,
+            pending_owner: None,
             rules: Rules::default(),
             spend: DailySpend::default(),
             log: Vec::new(),
@@ -459,9 +503,71 @@ impl Guard {
             if a == Principal::anonymous() {
                 return Err(Refusal::AgentIsAnonymous);
             }
+            // Otherwise accepting would make one principal owner and agent.
+            if Some(a) == self.pending_owner {
+                return Err(Refusal::AgentIsPendingOwner);
+            }
         }
         self.agent = agent;
         Ok(())
+    }
+
+    /// Owner only. `Some(p)` proposes `p` as the next owner (replacing an
+    /// earlier proposal); `None` withdraws the proposal. Nothing else changes
+    /// until `p` calls [`Guard::accept_owner`].
+    pub fn propose_owner(&mut self, caller: Principal, candidate: Option<Principal>, now_ns: u64) -> Result<(), Refusal> {
+        self.require_owner(caller)?;
+        let outcome = match candidate {
+            Some(c) => {
+                if c == Principal::anonymous() {
+                    return Err(Refusal::CandidateIsAnonymous);
+                }
+                if c == self.owner {
+                    return Err(Refusal::CandidateIsOwner);
+                }
+                if Some(c) == self.agent {
+                    return Err(Refusal::CandidateIsAgent);
+                }
+                Outcome::OwnerProposed { candidate: c }
+            }
+            None => {
+                let c = self.pending_owner.ok_or(Refusal::NoPendingOwner)?;
+                Outcome::OwnerProposalWithdrawn { candidate: c }
+            }
+        };
+        self.pending_owner = candidate;
+        self.log_handover(caller, outcome, now_ns);
+        Ok(())
+    }
+
+    /// Only the proposed owner. Makes the caller the owner; the previous
+    /// owner has no rights from this call on. Agent, policy and spend stay.
+    pub fn accept_owner(&mut self, caller: Principal, now_ns: u64) -> Result<(), Refusal> {
+        Self::reject_anonymous(caller)?;
+        // Same answer whether or not a proposal exists: strangers learn nothing.
+        if self.pending_owner != Some(caller) {
+            return Err(Refusal::NotPendingOwner);
+        }
+        // Cannot happen (both orders are refused above), checked anyway.
+        if Some(caller) == self.agent {
+            return Err(Refusal::CandidateIsAgent);
+        }
+        let previous_owner = std::mem::replace(&mut self.owner, caller);
+        self.pending_owner = None;
+        self.log_handover(caller, Outcome::OwnerAccepted { previous_owner }, now_ns);
+        Ok(())
+    }
+
+    fn log_handover(&mut self, caller: Principal, outcome: Outcome, now_ns: u64) {
+        self.push_log(|seq| AuditEntry {
+            seq,
+            time_ns: now_ns,
+            caller,
+            receiver_id: String::new(),
+            yocto: String::new(),
+            outcome,
+            message: None,
+        });
     }
 
     /// Replaces all three rules and the NEP-413 list at once. Today's spent
@@ -477,6 +583,7 @@ impl Guard {
         let day = utc_day(now_ns);
         Ok(Config {
             owner: self.owner,
+            pending_owner: self.pending_owner,
             agent: self.agent,
             policy: self.rules.to_policy(),
             utc_day: day,
@@ -817,6 +924,8 @@ mod tests {
         assert_eq!(g.set_agent(anon, None), Err(Refusal::AnonymousCaller));
         assert_eq!(g.config(anon, NOW).unwrap_err(), Refusal::AnonymousCaller);
         assert_eq!(g.audit_log(anon).unwrap_err(), Refusal::AnonymousCaller);
+        assert_eq!(g.propose_owner(anon, None, NOW), Err(Refusal::AnonymousCaller));
+        assert_eq!(g.accept_owner(anon, NOW), Err(Refusal::AnonymousCaller));
     }
 
     #[test]
@@ -833,6 +942,216 @@ mod tests {
         let mut g = configured();
         g.set_agent(owner(), None).unwrap();
         assert_eq!(ask(&mut g, agent(), "alice.testnet", 1, NOW).unwrap_err(), Refusal::NoAgent);
+    }
+
+    // ---- owner handover ------------------------------------------------------
+
+    fn successor() -> Principal {
+        p(5)
+    }
+
+    /// `configured()` plus 0.25 NEAR signed today, then `successor()` proposed
+    /// and accepted.
+    fn handed_over() -> Guard {
+        let mut g = configured();
+        sign(&mut g, "alice.testnet", NEAR / 4, NOW).unwrap();
+        g.propose_owner(owner(), Some(successor()), NOW).unwrap();
+        g.accept_owner(successor(), NOW).unwrap();
+        g
+    }
+
+    #[test]
+    fn handover_takes_two_steps() {
+        let mut g = configured();
+        g.propose_owner(owner(), Some(successor()), NOW).unwrap();
+        let c = g.config(owner(), NOW).unwrap();
+        assert_eq!((c.owner, c.pending_owner), (owner(), Some(successor())));
+        // Proposed is not owner: no rights yet, and the owner keeps all of them.
+        assert_eq!(g.set_policy(successor(), &policy(1, 1, &[])), Err(Refusal::NotOwner));
+        assert_eq!(g.set_agent(successor(), None), Err(Refusal::NotOwner));
+        assert_eq!(g.config(successor(), NOW).unwrap_err(), Refusal::NotOwnerOrAgent);
+        g.set_policy(owner(), &policy(NEAR / 2, NEAR * 8 / 10, &["alice.testnet"])).unwrap();
+
+        g.accept_owner(successor(), NOW).unwrap();
+        let c = g.config(successor(), NOW).unwrap();
+        assert_eq!((c.owner, c.pending_owner), (successor(), None));
+    }
+
+    #[test]
+    fn only_the_owner_proposes() {
+        let mut g = configured();
+        let before = g.clone();
+        for caller in [agent(), stranger(), successor()] {
+            assert_eq!(g.propose_owner(caller, Some(successor()), NOW), Err(Refusal::NotOwner));
+            assert_eq!(g.propose_owner(caller, None, NOW), Err(Refusal::NotOwner));
+        }
+        assert_eq!(g.propose_owner(Principal::anonymous(), Some(successor()), NOW), Err(Refusal::AnonymousCaller));
+        assert_eq!(g, before, "a refused proposal changed state");
+    }
+
+    #[test]
+    fn only_the_proposed_owner_accepts() {
+        let mut g = configured();
+        // Nothing proposed: nobody can accept, not even the owner.
+        for caller in [owner(), agent(), stranger(), successor()] {
+            assert_eq!(g.accept_owner(caller, NOW), Err(Refusal::NotPendingOwner));
+        }
+        g.propose_owner(owner(), Some(successor()), NOW).unwrap();
+        let before = g.clone();
+        for caller in [owner(), agent(), stranger()] {
+            assert_eq!(g.accept_owner(caller, NOW), Err(Refusal::NotPendingOwner));
+        }
+        assert_eq!(g.accept_owner(Principal::anonymous(), NOW), Err(Refusal::AnonymousCaller));
+        assert_eq!(g, before, "a refused acceptance changed state");
+        g.accept_owner(successor(), NOW).unwrap();
+        // Accepting twice: the proposal is used up.
+        assert_eq!(g.accept_owner(successor(), NOW), Err(Refusal::NotPendingOwner));
+    }
+
+    #[test]
+    fn candidate_is_not_anonymous_owner_or_agent() {
+        let mut g = configured();
+        let before = g.clone();
+        assert_eq!(g.propose_owner(owner(), Some(Principal::anonymous()), NOW), Err(Refusal::CandidateIsAnonymous));
+        assert_eq!(g.propose_owner(owner(), Some(owner()), NOW), Err(Refusal::CandidateIsOwner));
+        assert_eq!(g.propose_owner(owner(), Some(agent()), NOW), Err(Refusal::CandidateIsAgent));
+        assert_eq!(g, before, "a refused candidate changed state");
+    }
+
+    #[test]
+    fn proposal_can_be_withdrawn() {
+        let mut g = configured();
+        assert_eq!(g.propose_owner(owner(), None, NOW), Err(Refusal::NoPendingOwner));
+        g.propose_owner(owner(), Some(successor()), NOW).unwrap();
+        g.propose_owner(owner(), None, NOW).unwrap();
+        assert_eq!(g.config(owner(), NOW).unwrap().pending_owner, None);
+        assert_eq!(g.accept_owner(successor(), NOW), Err(Refusal::NotPendingOwner));
+        assert_eq!(g.owner, owner());
+    }
+
+    #[test]
+    fn a_new_proposal_replaces_the_old_one() {
+        let mut g = configured();
+        let typo = p(6);
+        g.propose_owner(owner(), Some(typo), NOW).unwrap();
+        g.propose_owner(owner(), Some(successor()), NOW).unwrap();
+        assert_eq!(g.config(owner(), NOW).unwrap().pending_owner, Some(successor()));
+        assert_eq!(g.accept_owner(typo, NOW), Err(Refusal::NotPendingOwner));
+        g.accept_owner(successor(), NOW).unwrap();
+        assert_eq!(g.owner, successor());
+    }
+
+    /// Decision: while a principal is proposed as owner, it cannot be made the
+    /// agent (and the agent cannot be proposed). Refused, not silently fixed.
+    #[test]
+    fn pending_owner_cannot_become_agent() {
+        let mut g = configured();
+        g.propose_owner(owner(), Some(successor()), NOW).unwrap();
+        let before = g.clone();
+        assert_eq!(g.set_agent(owner(), Some(successor())), Err(Refusal::AgentIsPendingOwner));
+        assert_eq!(g, before);
+        // Other agent changes still work while a proposal is pending.
+        g.set_agent(owner(), Some(stranger())).unwrap();
+        g.set_agent(owner(), Some(agent())).unwrap();
+        // After withdrawing, the same principal may be the agent ...
+        g.propose_owner(owner(), None, NOW).unwrap();
+        g.set_agent(owner(), Some(successor())).unwrap();
+        // ... and is then refused as candidate.
+        assert_eq!(g.propose_owner(owner(), Some(successor()), NOW), Err(Refusal::CandidateIsAgent));
+    }
+
+    #[test]
+    fn after_handover_only_the_new_owner_has_rights() {
+        let mut g = handed_over();
+        let old = owner();
+        assert_eq!(g.set_policy(old, &policy(u128::MAX, u128::MAX, &["attacker.testnet"])), Err(Refusal::NotOwner));
+        assert_eq!(g.set_agent(old, Some(stranger())), Err(Refusal::NotOwner));
+        assert_eq!(g.set_agent(old, None), Err(Refusal::NotOwner));
+        assert_eq!(g.propose_owner(old, Some(old), NOW), Err(Refusal::NotOwner));
+        assert_eq!(g.accept_owner(old, NOW), Err(Refusal::NotPendingOwner));
+        assert_eq!(g.config(old, NOW).unwrap_err(), Refusal::NotOwnerOrAgent);
+        assert_eq!(g.audit_log(old).unwrap_err(), Refusal::NotOwnerOrAgent);
+        assert_eq!(g.owner, successor());
+
+        g.set_policy(successor(), &policy(NEAR, NEAR, &["bob.testnet"])).unwrap();
+        g.set_agent(successor(), Some(p(7))).unwrap();
+        assert_eq!(g.set_agent(successor(), Some(successor())), Err(Refusal::AgentIsOwner));
+        // The previous owner may now be proposed back, like anyone else.
+        g.propose_owner(successor(), Some(old), NOW).unwrap();
+        g.accept_owner(old, NOW).unwrap();
+        assert_eq!(g.owner, old);
+    }
+
+    #[test]
+    fn owner_still_cannot_sign_after_handover() {
+        let mut g = handed_over();
+        assert_eq!(ask(&mut g, successor(), "alice.testnet", 1, NOW).unwrap_err(), Refusal::OwnerCannotSign);
+        // The previous owner is a stranger now: refused and only counted.
+        let logged = g.log.len();
+        assert_eq!(ask(&mut g, owner(), "alice.testnet", 1, NOW).unwrap_err(), Refusal::NotAgent);
+        assert_eq!(g.log.len(), logged, "the previous owner's request was logged");
+        let c = g.config(successor(), NOW).unwrap();
+        assert_eq!((c.rejected_unauthorized, c.spent_today_yocto), (1, (NEAR / 4).to_string()));
+    }
+
+    #[test]
+    fn handover_keeps_agent_policy_and_spend() {
+        let before = {
+            let mut g = configured();
+            sign(&mut g, "alice.testnet", NEAR / 4, NOW).unwrap();
+            g
+        };
+        let mut g = handed_over();
+        let (b, a) = (before.config(owner(), NOW).unwrap(), g.config(successor(), NOW).unwrap());
+        assert_eq!((a.agent, &a.policy, &a.spent_today_yocto), (b.agent, &b.policy, &b.spent_today_yocto));
+        assert_eq!(a.rejected_unauthorized, b.rejected_unauthorized);
+        // The agent keeps working under the same rules and the same budget:
+        // 0.25 signed before the handover + 0.5 now = 0.75, then 0.1 more is over 0.8.
+        sign(&mut g, "alice.testnet", NEAR / 2, NOW).unwrap();
+        assert_eq!(
+            ask(&mut g, agent(), "alice.testnet", NEAR / 10, NOW).unwrap_err(),
+            Refusal::OverDailyLimit { spent: NEAR * 3 / 4, amount: NEAR / 10, limit: NEAR * 8 / 10 }
+        );
+        assert_eq!(ask(&mut g, agent(), "attacker.testnet", 1, NOW).unwrap_err(), Refusal::ReceiverNotAllowed("attacker.testnet".into()));
+    }
+
+    #[test]
+    fn handover_steps_are_logged_and_refusals_are_not() {
+        let mut g = configured();
+        let typo = p(6);
+        g.propose_owner(owner(), Some(typo), NOW).unwrap();
+        g.propose_owner(owner(), None, NOW + 1).unwrap();
+        g.propose_owner(owner(), Some(successor()), NOW + 2).unwrap();
+        let logged = g.log.len();
+        let _ = g.accept_owner(stranger(), NOW);
+        let _ = g.accept_owner(typo, NOW);
+        let _ = g.propose_owner(agent(), Some(agent()), NOW);
+        let _ = g.propose_owner(owner(), Some(agent()), NOW);
+        let _ = g.propose_owner(Principal::anonymous(), None, NOW);
+        assert_eq!(g.log.len(), logged, "a refused handover call was logged");
+        g.accept_owner(successor(), NOW + 3).unwrap();
+
+        let log = g.audit_log(successor()).unwrap();
+        let steps: Vec<_> = log.iter().map(|e| (e.seq, e.time_ns, e.caller, e.outcome.clone())).collect();
+        assert_eq!(
+            steps,
+            [
+                (0, NOW, owner(), Outcome::OwnerProposed { candidate: typo }),
+                (1, NOW + 1, owner(), Outcome::OwnerProposalWithdrawn { candidate: typo }),
+                (2, NOW + 2, owner(), Outcome::OwnerProposed { candidate: successor() }),
+                (3, NOW + 3, successor(), Outcome::OwnerAccepted { previous_owner: owner() }),
+            ]
+        );
+        assert!(log.iter().all(|e| e.receiver_id.is_empty() && e.yocto.is_empty() && e.message.is_none()));
+    }
+
+    #[test]
+    fn pending_owner_survives_the_state_round_trip() {
+        let mut g = configured();
+        g.propose_owner(owner(), Some(successor()), NOW).unwrap();
+        let back: Guard = candid::decode_one(&candid::encode_one(&g).unwrap()).unwrap();
+        assert_eq!(back, g);
+        assert_eq!(back.pending_owner, Some(successor()));
     }
 
     #[test]
@@ -1380,5 +1699,6 @@ mod tests {
         assert_eq!((g.spend.spent, g.next_seq, g.rejected_unauthorized), (3, 3, 4));
         assert_eq!(g.log[0].outcome, Outcome::Signed { tx_hash: "T".into() });
         assert!(g.log.iter().all(|e| e.message.is_none()));
+        assert_eq!(g.pending_owner, None);
     }
 }

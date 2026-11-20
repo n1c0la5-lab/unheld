@@ -1,5 +1,6 @@
 [workspace]
-members = ["canister"]
+# test-canisters/: test only, never deployed as part of Unheld.
+members = ["canister", "test-canisters/owner-probe"]
 resolver = "2"
 
 [profile.release]
