@@ -95,13 +95,14 @@ elsewhere, or if `icp.yaml` points the `demo` environment at `ic`. The
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Owner
+    actor Owner as Owner<br/>(person or canister)
     participant Agent as AI agent<br/>(NEAR AI Cloud)
     participant Guard as guard canister<br/>(ICP)
     participant Subnet as ICP subnet<br/>(threshold Ed25519)
     participant NEAR as NEAR RPC
 
     Owner->>Guard: set_agent, set_policy (limits, allowlists)
+    Note over Owner,Guard: handover in two steps, propose_owner then accept_owner by the successor
     Agent->>NEAR: nonce + block hash
     Agent->>Guard: sign_transfer(receiver, amount)
     Guard->>Guard: per-tx limit, allowlist, daily limit
@@ -149,17 +150,38 @@ paid to whom.
 
 | Role | Who | May | May not |
 |---|---|---|---|
-| owner | the identity that installed the canister | set the agent (`set_agent`), set the policy (`set_policy`), read config and log | request signatures |
+| owner | the identity that installed the canister, or whoever later accepted ownership: a person's identity or another canister | set the agent (`set_agent`), set the policy (`set_policy`), propose a successor (`propose_owner`), read config and log | request signatures |
+| proposed owner | one principal, named by the owner with `propose_owner` | accept ownership (`accept_owner`) | anything else, until it has accepted |
 | agent | one principal, set by the owner | request signatures (`sign_transfer`, `sign_message`), read config and log | change the policy, change the agent |
 | anyone else | — | `account`, `preview_transfer` (signs nothing) | sign, set, read config or log |
 
 `init` refuses the anonymous principal as owner: the install traps and nothing
 is installed. Every protected method (`sign_transfer`, `sign_message`,
-`set_agent`, `set_policy`, `get_config`, `audit_log`) refuses an anonymous
-caller explicitly. The agent can never be the owner or the
-anonymous principal.
+`set_agent`, `set_policy`, `propose_owner`, `accept_owner`, `get_config`,
+`audit_log`) refuses an anonymous caller explicitly. The agent can never be
+the owner or the anonymous principal.
 The owner can replace the agent (`set_agent(opt <new>)`) or remove it
 (`set_agent(null)`); the old agent cannot sign from that moment on.
+
+**Owner handover** takes two steps, so a mistyped principal cannot end up
+owning the canister:
+
+1. The owner calls `propose_owner(opt <successor>)`. Nothing else changes; the
+   successor has no rights yet. A second call replaces the proposal,
+   `propose_owner(null)` withdraws it. Refused as successor: the anonymous
+   principal, the current owner, the current agent.
+2. The successor itself calls `accept_owner()`. From that call on it is the
+   owner, and the previous owner has no rights at all (it cannot set, read, or
+   accept back; it is a stranger like any other). Agent, policy, today's spent
+   amount and the log stay as they were.
+
+While a successor is pending, `set_agent` refuses to make it the agent
+(withdraw the proposal first); together with the refusal of the agent as
+successor, one principal can never end up as both owner and agent.
+`get_config` shows the pending successor as `pending_owner`. Tested natively
+(12 tests in `policy::tests`, plus the upgrade test below) and on the local
+network with a canister as the successor (`scripts/e2e-owner-canister.sh`,
+under [Run it](#run-it)).
 
 **Rules**, checked before every transfer signature, in this order:
 
@@ -188,22 +210,32 @@ one signed).
 or rejected, is logged with time, caller, receiver, amount (as requested,
 clipped to 64 characters) and outcome: `Signed` with the transaction hash, or
 `Rejected` with the reason. `Pending` marks a request whose signature has not
-come back yet. The log is a ring buffer of the last 1000 entries; `seq` keeps
+come back yet. Each owner handover step is an entry too, with empty receiver
+and amount: `OwnerProposed` and `OwnerProposalWithdrawn` (caller: the owner,
+with the successor's principal) and `OwnerAccepted` (caller: the new owner,
+with the previous owner's principal). Refused handover calls change nothing and
+are not logged. The log is a ring buffer of the last 1000 entries; `seq` keeps
 counting, so a gap at the start shows evicted entries. Calls from anyone else
 are **counted, not logged** (`rejected_unauthorized` in `get_config`), so a
 stranger cannot push the real entries out of the ring buffer. Owner and agent
 read the log with `audit_log` (a query call, answered by one replica and not
 certified).
 
-**Upgrades** keep owner, agent, policy (including the NEP-413 list), today's
-spent amount, the counter and the audit log: `pre_upgrade` writes them to
+**Upgrades** keep owner, a pending successor, agent, policy (including the
+NEP-413 list), today's spent amount, the counter and the audit log: `pre_upgrade` writes them to
 stable memory as one candid value (`stable_save`). That value is bounded: a
 test fills both allowlists and the log with maximum-size entries and measures
 835,449 bytes (`policy::tests::worst_case_state_size`). State saved by the
 previous version (without the NEP-413 fields) still restores, with an empty
 NEP-413 list (`policy::tests::state_from_before_nep413_still_decodes`; measured
 locally: an upgrade of a canister running the previous version kept its policy
-and its 16 log entries). Upgrading the spike version to this one is refused
+and its 16 log entries). State saved before owner handover existed restores
+with no pending successor and every log entry unchanged
+(`upgrade_tests::state_from_before_owner_handover_restores`, which decodes the
+old layout exactly as `post_upgrade` does; measured locally: a canister
+running `main` at `39f12b6`, upgraded to this version, kept owner, agent,
+policy, spent amount and its 3 log entries, showed `pending_owner = null`, and
+then completed a handover). Upgrading the spike version to this one is refused
 (`post_upgrade` traps and the upgrade rolls back, measured locally): reinstall
 instead. The NEAR account stays the same either way, because the key depends
 on the canister id, not on its state.
@@ -269,9 +301,21 @@ the canister holds one and puts its own limits in front of it.
 **What the policy does not cover.** The policy binds callers of the canister,
 not its **controllers**: a controller can install different code. Who controls
 the canister is set at deploy time (`icp canister status guard` lists them).
+An owner handover does not change the controllers: when the people in charge
+change, the controller list has to be changed as well, separately
+(`icp canister settings update`).
 
-**Not built:** time windows, multi-signature approval, rate limits per minute,
-more than one agent, tokens other than NEAR, executing NEAR Intents.
+The owner is **one principal**. Unheld itself does not collect approvals from
+several people. That principal can be a canister, and a canister that needs
+several approvals before it calls (a multi-approval wallet such as Orbit) can
+then be the owner; who may approve is managed there. What is tested is a
+minimal test canister as the owner (`test-canisters/owner-probe`, not part of
+Unheld), not Orbit or any other wallet.
+
+**Not built:** time windows, approval by several people inside the canister,
+roles beyond one owner and one agent, a delay before a handover takes effect,
+rate limits per minute, more than one agent, tokens other than NEAR, executing
+NEAR Intents.
 
 ## Run it
 
@@ -296,6 +340,7 @@ icp deploy
 
 # scripts
 scripts/e2e-policy.sh                  # local end-to-end test of the policy, sends nothing to NEAR
+scripts/e2e-owner-canister.sh          # local: a canister accepts ownership, then sets the policy
 
 cd scripts && npm ci --ignore-scripts
 node spike.mjs account                 # prints the canister's NEAR account
@@ -321,6 +366,21 @@ lengths, roles, a signed message checked by near-api-js via
 the real response passes, six tampered or different ones are refused), and
 replacing and removing the agent. Its signed transactions use a fake block
 hash (32 zero bytes), so no NEAR network would accept them.
+
+`scripts/e2e-owner-canister.sh` measures a **canister as the owner**. It builds
+the test canister `test-canisters/owner-probe` (test only: it forwards
+`accept_owner` and `set_policy` to the guard as inter-canister calls, and only
+its controllers may call it), reinstalls `guard` in the local environment,
+creates one probe canister per run, and checks: the owner proposes a wrong
+principal, then replaces it with the probe (`pending_owner` shows the probe);
+strangers and the agent cannot propose, the replaced principal cannot accept,
+a stranger cannot drive the probe; the probe cannot
+set the policy before accepting and cannot become the agent while it is
+pending; the probe accepts, `get_config` shows it as owner with agent and policy
+unchanged; the probe sets a new policy; the previous owner is refused on every
+owner method and cannot read config or log; the agent signs under the new
+policy (and is refused outside it); the log holds the three handover steps.
+36 checks; CI runs it in the quickstart job.
 
 The local network listens on **port 8010** (set in `icp.yaml`); 8000 is a
 common default and was taken on our dev machine. Change it there if 8010 is
@@ -416,6 +476,19 @@ copy with one rule broken (`cargo test --no-fail-fast`, 33 tests):
 | NEP-413: message length not bounded | 1 test red |
 | NEP-413: refused messages not logged | 3 tests red |
 
+Owner handover, each run on a copy with one rule broken (`cargo test -p guard --lib`, 58 tests):
+
+| Deliberate bug | Caught |
+|---|---|
+| `propose_owner` without owner check | 2 tests red |
+| anyone may accept once a proposal exists | 3 tests red |
+| the agent may be proposed | 3 tests red |
+| the anonymous principal may be proposed | 1 test red |
+| `set_agent` may make the pending successor the agent | 1 test red |
+| proposal not cleared on acceptance | 2 tests red |
+| acceptance not logged | 2 tests red |
+| `pending_owner` stored as `principal` instead of `opt principal` (state of the previous version no longer decodes) | 2 tests red |
+
 And two probes against the deployed canister on the local network, with
 `scripts/e2e-policy.sh`:
 
@@ -427,6 +500,12 @@ And two probes against the deployed canister on the local network, with
 | canister signs NEP-413 with tag 413 | 1 check red: near-api-js `verifyMessage` refuses all 3 signatures |
 | canister encodes `callbackUrl` `None` as nothing | 1 check red: near-api-js refuses the message without callback |
 | `check-nep413.mjs` skips `verifyMessage` | 1 check red: 6 altered messages accepted |
+
+And one with `scripts/e2e-owner-canister.sh`:
+
+| Deliberate bug | Caught |
+|---|---|
+| `accept_owner` answers `Ok` but keeps the old owner | 18 of 36 checks red, first: `get_config` does not show the probe as owner |
 
 And two probes against the check of the signed transaction
 (`scripts/check-signed.mjs`, run against the local canister):
@@ -788,6 +867,10 @@ the agent's identity and are not open to others.
   and NEAR account, NEP-413 messages (checked by near-api-js), the
   signed-transaction check, and agent replacement and removal. (The testnet transfer above was
   signed by the spike, before the policy existed.)
+- **A canister as the owner, on the local network.** `scripts/e2e-owner-canister.sh`
+  passes all 36 checks: a test canister accepts ownership and sets the policy
+  through inter-canister calls, the previous owner is refused, the agent signs
+  under the new policy. Orbit or another multi-approval wallet was not tested.
 - **Policy-checked transfer on NEAR testnet.** With a policy of 0.2 NEAR per
   transfer, 2 NEAR per day and one allowed receiver, the agent identity asked
   three times through `spike.mjs send`: `attacker.testnet` → refused (allowlist),
@@ -806,8 +889,13 @@ the agent's identity and are not open to others.
   confirmed it by its cost. There is no query for the key name, and a canister
   installed without the argument has a different key and so a different NEAR
   account.
-- **Upgrades.** Exercised on the local network only (`scripts/e2e-policy.sh`);
-  none has been run on the mainnet canister.
+- **Upgrades.** Exercised on the local network only (`scripts/e2e-policy.sh`,
+  and once from `main` at `39f12b6` to the version with owner handover); none
+  has been run on the mainnet canister.
+- **Owner handover on mainnet.** The mainnet canister runs `1f2ccd2`, which has
+  no `propose_owner` or `accept_owner`: there the owner can still only be
+  changed by installing new code. Getting the handover there takes an upgrade,
+  which has not been run.
 - **Policy with real NEAR.** One policy-checked transfer from the local
   canister and one from the mainnet canister have reached NEAR testnet (above);
   everything else ran with fake block hashes. Not on NEAR mainnet.
